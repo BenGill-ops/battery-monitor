@@ -1,0 +1,13 @@
+{
+  "ntfyTopic": "",
+  "foxessSN": "",
+  "amberSiteId": "",
+  "nightStartHour": 18,
+  "nightEndHour": 6,
+  "lowBatteryPct": 30,
+  "exportBelowPct": 40,
+  "highPriceCents": 35,
+  "gridImportKw": 0.5,
+  "summaryHour": 21,
+  "repeatMinutes": 60
+}
