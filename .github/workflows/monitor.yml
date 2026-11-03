@@ -2,6 +2,7 @@ name: Battery monitor
 
 on:
   schedule:
+    # GitHub may delay or skip runs at busy times; every 5 minutes is the minimum.
     - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
