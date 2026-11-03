@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'test = send a test alert, summary = send the daily summary now'
+        description: 'test = send a test alert, summary = daily summary now, morning = weather outlook now'
         type: choice
-        options: [check, test, summary]
+        options: [check, test, summary, morning]
         default: check
 
 concurrency:
@@ -37,10 +37,13 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           FOXESS_SN: ${{ secrets.FOXESS_SN }}
           AMBER_SITE_ID: ${{ secrets.AMBER_SITE_ID }}
+          WEATHER_LAT: ${{ secrets.WEATHER_LAT }}
+          WEATHER_LON: ${{ secrets.WEATHER_LON }}
         run: |
           $mode = '${{ inputs.mode }}'
           if ($mode -eq 'test') { ./monitor.ps1 -Test }
           elseif ($mode -eq 'summary') { ./monitor.ps1 -ForceSummary }
+          elseif ($mode -eq 'morning') { ./monitor.ps1 -ForceMorning }
           else { ./monitor.ps1 }
 
       - name: Save alert state

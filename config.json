@@ -9,5 +9,15 @@
   "highPriceCents": 35,
   "gridImportKw": 0.5,
   "summaryHour": 21,
+  "latitude": null,
+  "longitude": null,
+  "morningHour": 7,
+  "solarKwhPerMJ": 2.1,
+  "stormCape": 1500,
+  "stormRainPct": 60,
+  "stormLookaheadHours": 6,
+  "bomWarningsFeed": "https://www.bom.gov.au/fwo/IDZ00056.warnings_qld.xml",
+  "bomAreaWords": ["Southeast Coast", "South East Coast", "Gold Coast", "Currumbin", "Tallebudgera"],
+  "bomWarningWords": ["Severe Thunderstorm", "Severe Weather", "Tropical Cyclone", "Flood", "Strong Wind", "Damaging Wind"],
   "repeatMinutes": 60
 }

@@ -1,6 +1,6 @@
 # Read-only battery monitor: checks FoxESS + Amber and pushes alerts to ntfy.
 # Never changes inverter settings. Runs every 5 minutes on GitHub Actions (or locally with -DryRun).
-param([switch]$DryRun, [switch]$ForceSummary, [switch]$Test)
+param([switch]$DryRun, [switch]$ForceSummary, [switch]$ForceMorning, [switch]$Test)
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -12,6 +12,8 @@ if (Test-Path $localCfg) { (Get-Content $localCfg -Raw | ConvertFrom-Json).psobj
 if ($env:NTFY_TOPIC) { $cfg.ntfyTopic = $env:NTFY_TOPIC }
 if ($env:FOXESS_SN) { $cfg.foxessSN = $env:FOXESS_SN }
 if ($env:AMBER_SITE_ID) { $cfg.amberSiteId = $env:AMBER_SITE_ID }
+if ($env:WEATHER_LAT) { $cfg.latitude = [double]$env:WEATHER_LAT }
+if ($env:WEATHER_LON) { $cfg.longitude = [double]$env:WEATHER_LON }
 $api = Join-Path $dir 'foxess.ps1'
 $statePath = Join-Path $dir 'state.json'
 $logPath = Join-Path $dir 'monitor.log'
@@ -33,6 +35,48 @@ function Amber($path) {
     $key = $key.Trim()
     Invoke-RestMethod -Uri ('https://api.amber.com.au/v1' + $path) -Headers @{ Authorization = "Bearer $key" }
 }
+
+# Open-Meteo forecast (free, no key). Returns $null if no location is configured.
+function Get-Weather {
+    if ($null -eq $cfg.latitude -or $null -eq $cfg.longitude) { return $null }
+    $u = 'https://api.open-meteo.com/v1/forecast?latitude={0}&longitude={1}&timezone=Australia%2FBrisbane&forecast_days=2' -f $cfg.latitude, $cfg.longitude
+    $u += '&hourly=weather_code,precipitation_probability,cape,wind_gusts_10m&daily=shortwave_radiation_sum,precipitation_probability_max,wind_gusts_10m_max'
+    Invoke-RestMethod $u
+}
+
+# Storm hours: thunderstorm codes (95-99), or unstable air (high CAPE) with likely rain.
+function Get-StormHours($wx, [datetime]$from, [datetime]$to) {
+    $hours = @()
+    for ($i = 0; $i -lt $wx.hourly.time.Count; $i++) {
+        $t = [datetime]$wx.hourly.time[$i]
+        if ($t -lt $from -or $t -ge $to) { continue }
+        $code = [int]$wx.hourly.weather_code[$i]
+        $storm = $code -ge 95 -or ([double]$wx.hourly.cape[$i] -ge $cfg.stormCape -and [double]$wx.hourly.precipitation_probability[$i] -ge $cfg.stormRainPct)
+        if ($storm) { $hours += [pscustomobject]@{ Time = $t; Rain = $wx.hourly.precipitation_probability[$i]; Gust = $wx.hourly.wind_gusts_10m[$i] } }
+    }
+    $hours
+}
+
+function Format-StormWindow($hours) {
+    $first = $hours[0].Time; $last = $hours[-1].Time.AddHours(1)
+    $rain = ($hours.Rain | Measure-Object -Maximum).Maximum
+    $gust = ($hours.Gust | Measure-Object -Maximum).Maximum
+    '{0}-{1} (rain up to {2}%, gusts {3} km/h)' -f $first.ToString('h tt').ToLower(), $last.ToString('h tt').ToLower(), $rain, [math]::Round($gust)
+}
+
+# Active BOM warnings that mention your area (cancellations and final notices are skipped).
+function Get-BomWarnings {
+    $xml = [xml](Invoke-WebRequest $cfg.bomWarningsFeed -UseBasicParsing -UserAgent 'Mozilla/5.0 (battery-monitor)').Content
+    foreach ($item in $xml.rss.channel.item) {
+        $title = ($item.title -replace '\s+', ' ').Trim()
+        if ($title -match 'Cancellation|Final ') { continue }
+        $area = $cfg.bomAreaWords | Where-Object { $title -like "*$_*" }
+        $kind = $cfg.bomWarningWords | Where-Object { $title -like "*$_*" }
+        if ($area -and $kind) { [pscustomobject]@{ Title = $title; Link = $item.link; Id = "$($item.link)|$($item.pubDate)"; Severe = $title -match 'Severe Thunderstorm|Tropical Cyclone|Severe Weather' } }
+    }
+}
+
+function Get-SolarEstimate($wx, $dayIndex) { [math]::Round([double]$wx.daily.shortwave_radiation_sum[$dayIndex] * $cfg.solarKwhPerMJ) }
 
 if ($Test) { Send-Alert 'Battery monitor' 'Test alert - the monitor can reach your phone.' 'default' 'white_check_mark'; exit }
 
@@ -64,9 +108,14 @@ try {
         $feedPrice = -($p | Where-Object channelType -eq 'feedIn' | Select-Object -First 1).perKwh
     } catch { Log "Amber price error: $($_.Exception.Message)" }
 
+    $wx = $null
+    try { $wx = Get-Weather } catch { Log "Weather error: $($_.Exception.Message)" }
+    $stormSoon = @()
+    if ($wx) { $stormSoon = @(Get-StormHours $wx $now.AddHours(-1) $now.AddHours($cfg.stormLookaheadHours)) }
+
     $night = $now.Hour -ge $cfg.nightStartHour -or $now.Hour -lt $cfg.nightEndHour
     $line = 'SoC {0}% | load {1} kW | solar {2} kW | export {3} kW | grid {4} kW | mode {5} | price {6}c' -f $soc, $d.loadsPower, $d.pvPower, $d.feedinPower, $d.gridConsumptionPower, $activeMode, $price
-    if ($DryRun) { Write-Output $line }
+    if ($DryRun) { Write-Output $line; if ($stormSoon.Count) { Write-Output "Storm in next $($cfg.stormLookaheadHours)h: $(Format-StormWindow $stormSoon)" } }
 
     # 1. Low battery at night
     if ($night -and $soc -lt $cfg.lowBatteryPct -and (Due 'lowBattery')) {
@@ -84,14 +133,44 @@ try {
         Mark 'lowExport'
     }
 
+    # 2b. Exporting while a storm (possible blackout) is close - urgent at any battery level
+    if ($exporting -and $stormSoon.Count -gt 0 -and (Due 'stormExport')) {
+        Send-Alert "Exporting before a storm ($soc%)" "Amber is sending $($d.feedinPower) kW to the grid with storms forecast $(Format-StormWindow $stormSoon). Battery at $soc%. Consider pausing SmartShift to keep backup power." 'urgent' 'zap'
+        Mark 'stormExport'
+    }
+
+    # 2c. BOM warning for your area - sent once per issued warning
+    $bom = @()
+    try { $bom = @(Get-BomWarnings) } catch { Log "BOM error: $($_.Exception.Message)" }
+    foreach ($w in $bom) {
+        if ($state["bom:$($w.Id)"]) { continue }
+        $extra = if ($exporting) { " Amber is exporting $($d.feedinPower) kW right now - consider pausing SmartShift." } else { '' }
+        Send-Alert 'BOM warning for your area' "$($w.Title)`nBattery at $soc%.$extra`n$($w.Link)" $(if ($w.Severe) { 'urgent' } else { 'high' }) 'rotating_light'
+        $state["bom:$($w.Id)"] = $now.ToString('o')
+    }
+    if ($DryRun) { Write-Output "BOM warnings for area: $($bom.Count)"; $bom | ForEach-Object { Write-Output "  $($_.Title)" } }
+
     # 3. Buying from the grid at a high price
     if ($price -ne $null -and $price -ge $cfg.highPriceCents -and $d.gridConsumptionPower -ge $cfg.gridImportKw -and (Due 'highPrice')) {
         Send-Alert "Buying power at $([math]::Round($price))c" "Importing $($d.gridConsumptionPower) kW from the grid at $([math]::Round($price,1))c/kWh. Battery at $soc%." 'default' 'moneybag'
         Mark 'highPrice'
     }
 
-    # 4. Daily summary, once per day at summaryHour
     $today = $now.ToString('yyyy-MM-dd')
+
+    # 4. Morning weather outlook, once per day at morningHour
+    if ($wx -and ($ForceMorning -or ($now.Hour -eq $cfg.morningHour -and $state['morningDate'] -ne $today))) {
+        $dayStorms = @(Get-StormHours $wx $now.Date $now.Date.AddDays(1))
+        $solar = Get-SolarEstimate $wx 0
+        if ($dayStorms.Count -gt 0) {
+            Send-Alert "Storms forecast today" "Storms likely $(Format-StormWindow $dayStorms). Possible blackout.`nBattery at $soc%, solar expected ~$solar kWh.`nTo keep backup power, consider raising the reserve or pausing SmartShift this afternoon." 'high' 'cloud_with_lightning'
+        } else {
+            Send-Alert "Today's solar outlook" "Solar expected ~$solar kWh, rain chance $($wx.daily.precipitation_probability_max[0])%. No storms forecast.`nBattery at $soc%." 'low' 'partly_sunny'
+        }
+        if (-not $ForceMorning) { $state['morningDate'] = $today }
+    }
+
+    # 5. Daily summary, once per day at summaryHour
     if ($ForceSummary -or ($now.Hour -eq $cfg.summaryHour -and $state['summaryDate'] -ne $today)) {
         $rep = Fox '/op/v0/device/report/query' ('{"sn":"' + $cfg.foxessSN + '","year":' + $now.Year + ',"month":' + $now.Month + ',"dimension":"month","variables":["PVEnergyTotal","loads","feedin","gridConsumption"]}')
         $t = @{}; foreach ($v in $rep.result) { $t[$v.variable] = [math]::Round([double]$v.values[$now.Day - 1], 1) }
@@ -104,7 +183,13 @@ try {
             $earn = -(($u | Where-Object channelIdentifier -eq 'B1' | Measure-Object cost -Sum).Sum) / 100
             $money = "`n$y (Amber): earned `${0:N2}, spent `${1:N2}, net `${2:N2}" -f $earn, $cost, ($earn - $cost)
         } catch { Log "Amber usage error: $($_.Exception.Message)" }
-        $msg = "Solar $($t.PVEnergyTotal) kWh | used $($t.loads) kWh`nExported $($t.feedin) kWh | bought $($t.gridConsumption) kWh`nBattery now $soc%$money"
+        $outlook = ''
+        if ($wx) {
+            $tmrStorms = @(Get-StormHours $wx $now.Date.AddDays(1) $now.Date.AddDays(2))
+            $outlook = "`nTomorrow: ~$(Get-SolarEstimate $wx 1) kWh solar expected"
+            if ($tmrStorms.Count -gt 0) { $outlook += ", storms $(Format-StormWindow $tmrStorms)" }
+        }
+        $msg = "Solar $($t.PVEnergyTotal) kWh | used $($t.loads) kWh`nExported $($t.feedin) kWh | bought $($t.gridConsumption) kWh`nBattery now $soc%$money$outlook"
         Send-Alert 'Daily battery summary' $msg 'default' 'sunny'
         if (-not $ForceSummary) { $state['summaryDate'] = $today }
     }
