@@ -105,7 +105,7 @@ try {
             $money = "`n$y (Amber): earned `${0:N2}, spent `${1:N2}, net `${2:N2}" -f $earn, $cost, ($earn - $cost)
         } catch { Log "Amber usage error: $($_.Exception.Message)" }
         $msg = "Solar $($t.PVEnergyTotal) kWh | used $($t.loads) kWh`nExported $($t.feedin) kWh | bought $($t.gridConsumption) kWh`nBattery now $soc%$money"
-        Send-Alert 'Daily battery summary' $msg 'low' 'sunny'
+        Send-Alert 'Daily battery summary' $msg 'default' 'sunny'
         if (-not $ForceSummary) { $state['summaryDate'] = $today }
     }
 } catch {
