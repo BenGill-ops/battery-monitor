@@ -12,6 +12,8 @@
   "latitude": null,
   "longitude": null,
   "morningHour": 7,
+  "quietStartHour": 22,
+  "quietEndHour": 6,
   "solarKwhPerMJ": 2.1,
   "stormCape": 1500,
   "stormRainPct": 60,

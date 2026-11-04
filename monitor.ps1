@@ -25,6 +25,12 @@ function Log($msg) {
 }
 
 function Send-Alert($title, $msg, $priority = 'default', $tags = 'battery') {
+    # Quiet hours: only urgent alerts go out; the rest are held for the morning outlook.
+    if ($quiet -and $priority -ne 'urgent') {
+        $state['overnight'] = (@($state['overnight']) + "$($now.ToString('h:mm tt').ToLower()) $title") -ne $null
+        Log "HELD (quiet hours) $title :: $msg"
+        return
+    }
     if ($DryRun) { Write-Output "[DRY RUN] $title :: $msg"; return }
     $headers = @{ Title = $title; Priority = $priority; Tags = $tags }
     Invoke-RestMethod -Uri "https://ntfy.sh/$($cfg.ntfyTopic)" -Method Post -Headers $headers -Body ([Text.Encoding]::UTF8.GetBytes($msg)) | Out-Null
@@ -93,6 +99,9 @@ if (Test-Path $statePath) { (Get-Content $statePath -Raw | ConvertFrom-Json).pso
 # Work in Brisbane time (no daylight saving) so night hours are right on a UTC cloud runner.
 $tzId = if ($IsLinux -or $IsMacOS) { 'Australia/Brisbane' } else { 'E. Australia Standard Time' }
 $now = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([datetime]::UtcNow, $tzId)
+$quiet = $now.Hour -ge $cfg.quietStartHour -or $now.Hour -lt $cfg.quietEndHour
+# A "night" runs from evening to morning, so key it by the date it started.
+$nightKey = $(if ($now.Hour -lt 12) { $now.Date.AddDays(-1) } else { $now.Date }).ToString('yyyy-MM-dd')
 function Due($name) { -not $state[$name] -or ($now - [datetime]$state[$name]).TotalMinutes -ge $cfg.repeatMinutes }
 function Mark($name) { $state[$name] = $now.ToString('o') }
 
@@ -124,11 +133,16 @@ try {
     $line = 'SoC {0}% | load {1} kW | solar {2} kW | export {3} kW | grid {4} kW | mode {5} | buy {6}c | feed-in {7}c' -f $soc, $d.loadsPower, $d.pvPower, $d.feedinPower, $d.gridConsumptionPower, $activeMode, [math]::Round([double]$price,1), [math]::Round([double]$feedPrice,1)
     if ($DryRun) { Write-Output $line; if ($stormSoon.Count) { Write-Output "Storm in next $($cfg.stormLookaheadHours)h: $(Format-StormWindow $stormSoon)" } }
 
-    # 1. Low battery at night
-    if ($night -and $soc -lt $cfg.lowBatteryPct -and (Due 'lowBattery')) {
+    # Remember the lowest battery level overnight for the morning outlook.
+    if ($quiet -and ($null -eq $state['overnightMinSoc'] -or $soc -lt [double]$state['overnightMinSoc'])) {
+        $state['overnightMinSoc'] = $soc; $state['overnightMinAt'] = $now.ToString('h:mm tt').ToLower()
+    }
+
+    # 1. Low battery at night - once per night
+    if ($night -and $soc -lt $cfg.lowBatteryPct -and $state['lowBatteryNight'] -ne $nightKey) {
         $hrs = if ($d.loadsPower -gt 0.1) { [math]::Round(((($soc - 10) / 100) * 41.9) / $d.loadsPower, 1) } else { 'many' }
         Send-Alert "Battery low: $soc%" "Battery is at $soc% with the house using $($d.loadsPower) kW. About $hrs h until the 10% floor." 'high' 'warning'
-        Mark 'lowBattery'
+        $state['lowBatteryNight'] = $nightKey
     }
 
     # 2. Amber force-exporting while the battery is already low
@@ -166,15 +180,27 @@ try {
     $today = $now.ToString('yyyy-MM-dd')
 
     # 4. Morning weather outlook, once per day on the first run between morningHour and noon (GitHub can skip runs)
-    if ($wx -and ($ForceMorning -or ($now.Hour -ge $cfg.morningHour -and $now.Hour -lt 12 -and $state['morningDate'] -ne $today))) {
-        $dayStorms = @(Get-StormHours $wx $now.Date $now.Date.AddDays(1))
-        $solar = Get-SolarEstimate $wx 0
-        if ($dayStorms.Count -gt 0) {
-            Send-Alert "Storms forecast today" "Storms likely $(Format-StormWindow $dayStorms). Possible blackout.`nBattery at $soc%, solar expected ~$solar kWh.`nTo keep backup power, consider raising the reserve or pausing SmartShift this afternoon." 'high' 'cloud_with_lightning'
+    # Includes an overnight recap: lowest battery and any alerts held during quiet hours.
+    if ($ForceMorning -or (-not $quiet -and $now.Hour -ge $cfg.morningHour -and $now.Hour -lt 12 -and $state['morningDate'] -ne $today)) {
+        $recap = ''
+        if ($null -ne $state['overnightMinSoc']) { $recap = "`nOvernight: lowest battery $($state['overnightMinSoc'])% at $($state['overnightMinAt'])." }
+        $held = @($state['overnight']) -ne $null
+        if ($held.Count) { $recap += "`nHeld overnight: " + ($held -join '; ') }
+        if (-not $wx) {
+            Send-Alert "Good morning" "Battery at $soc%. (Weather forecast unavailable.)$recap" 'low' 'battery'
         } else {
-            Send-Alert "Today's solar outlook" "Solar expected ~$solar kWh, rain chance $($wx.daily.precipitation_probability_max[0])%. No storms forecast.`nBattery at $soc%." 'low' 'partly_sunny'
+            $dayStorms = @(Get-StormHours $wx $now.Date $now.Date.AddDays(1))
+            $solar = Get-SolarEstimate $wx 0
+            if ($dayStorms.Count -gt 0) {
+                Send-Alert "Storms forecast today" "Storms likely $(Format-StormWindow $dayStorms). Possible blackout.`nBattery at $soc%, solar expected ~$solar kWh.`nTo keep backup power, consider raising the reserve or pausing SmartShift this afternoon.$recap" 'high' 'cloud_with_lightning'
+            } else {
+                Send-Alert "Today's solar outlook" "Solar expected ~$solar kWh, rain chance $($wx.daily.precipitation_probability_max[0])%. No storms forecast.`nBattery at $soc%.$recap" 'low' 'partly_sunny'
+            }
         }
-        if (-not $ForceMorning) { $state['morningDate'] = $today }
+        if (-not $ForceMorning) {
+            $state['morningDate'] = $today
+            $state.Remove('overnight'); $state.Remove('overnightMinSoc'); $state.Remove('overnightMinAt')
+        }
     }
 
     # 5. Daily summary, once per day on the first run from summaryHour to midnight
