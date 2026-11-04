@@ -121,7 +121,7 @@ try {
     if ($wx) { $stormSoon = @(Get-StormHours $wx $now.AddHours(-1) $now.AddHours($cfg.stormLookaheadHours)) }
 
     $night = $now.Hour -ge $cfg.nightStartHour -or $now.Hour -lt $cfg.nightEndHour
-    $line = 'SoC {0}% | load {1} kW | solar {2} kW | export {3} kW | grid {4} kW | mode {5} | price {6}c' -f $soc, $d.loadsPower, $d.pvPower, $d.feedinPower, $d.gridConsumptionPower, $activeMode, $price
+    $line = 'SoC {0}% | load {1} kW | solar {2} kW | export {3} kW | grid {4} kW | mode {5} | buy {6}c | feed-in {7}c' -f $soc, $d.loadsPower, $d.pvPower, $d.feedinPower, $d.gridConsumptionPower, $activeMode, [math]::Round([double]$price,1), [math]::Round([double]$feedPrice,1)
     if ($DryRun) { Write-Output $line; if ($stormSoon.Count) { Write-Output "Storm in next $($cfg.stormLookaheadHours)h: $(Format-StormWindow $stormSoon)" } }
 
     # 1. Low battery at night
