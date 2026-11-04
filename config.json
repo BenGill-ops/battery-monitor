@@ -14,6 +14,8 @@
   "morningHour": 7,
   "quietStartHour": 22,
   "quietEndHour": 6,
+  "gridDownVolts": 180,
+  "staleMinutes": 20,
   "solarKwhPerMJ": 2.1,
   "stormCape": 1500,
   "stormRainPct": 60,

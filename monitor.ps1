@@ -106,10 +106,33 @@ function Due($name) { -not $state[$name] -or ($now - [datetime]$state[$name]).To
 function Mark($name) { $state[$name] = $now.ToString('o') }
 
 try {
-    $rt = Fox '/op/v0/device/real/query' ('{"sn":"' + $cfg.foxessSN + '","variables":["SoC","batDischargePower","batChargePower","loadsPower","feedinPower","gridConsumptionPower","pvPower"]}')
+    $rt = Fox '/op/v0/device/real/query' ('{"sn":"' + $cfg.foxessSN + '","variables":["SoC","batDischargePower","batChargePower","loadsPower","feedinPower","gridConsumptionPower","pvPower","RVolt","epsPower","runningState"]}')
     if ($rt.errno -ne 0) { throw "FoxESS errno $($rt.errno) $($rt.msg)" }
     $d = @{}; $rt.result[0].datas | ForEach-Object { $d[$_.variable] = [double]$_.value }
     $soc = $d.SoC
+
+    # 0. Blackout detection (urgent, any time of night).
+    # Grid voltage drops to ~0 when the grid fails while the inverter keeps reporting on battery.
+    # If the internet router isn't on backup power, readings stop instead - so stale data is flagged too.
+    $readAt = [datetime]::ParseExact($rt.result[0].time.Substring(0, 19), 'yyyy-MM-dd HH:mm:ss', $null)
+    $staleMin = [math]::Round(($now - $readAt).TotalMinutes)
+    if ($staleMin -ge $cfg.staleMinutes) {
+        if (-not $state['stale']) {
+            Send-Alert 'Lost contact with battery' "No data from the inverter for $staleMin minutes. Possible blackout (if the internet router has no backup power) or an internet/Wi-Fi outage.`nLast reading: battery $soc%." 'urgent' 'rotating_light'
+            $state['stale'] = $now.ToString('o')
+        }
+    } else {
+        if ($state['stale']) { Send-Alert 'Battery back online' "Inverter data is coming through again. Battery at $soc%." 'default' 'white_check_mark'; $state.Remove('stale') }
+        $gridDown = $null -ne $d.RVolt -and $d.RVolt -lt $cfg.gridDownVolts
+        if ($gridDown -and -not $state['gridDown']) {
+            Send-Alert 'BLACKOUT - grid power is off' "Grid voltage is $($d.RVolt) V. The house is running on battery (backup circuit) at $soc%, using $($d.epsPower) kW." 'urgent' 'rotating_light'
+            $state['gridDown'] = $now.ToString('o')
+        } elseif (-not $gridDown -and $state['gridDown']) {
+            $mins = [math]::Round(($now - [datetime]$state['gridDown']).TotalMinutes)
+            Send-Alert 'Grid power is back' "Grid restored ($($d.RVolt) V) after about $mins minutes. Battery at $soc%." 'default' 'white_check_mark'
+            $state.Remove('gridDown')
+        }
+    }
 
     $sched = Fox '/op/v1/device/scheduler/get' ('{"deviceSN":"' + $cfg.foxessSN + '"}')
     $hm = $now.Hour * 60 + $now.Minute
