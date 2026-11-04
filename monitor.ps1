@@ -158,8 +158,8 @@ try {
 
     $today = $now.ToString('yyyy-MM-dd')
 
-    # 4. Morning weather outlook, once per day at morningHour
-    if ($wx -and ($ForceMorning -or ($now.Hour -eq $cfg.morningHour -and $state['morningDate'] -ne $today))) {
+    # 4. Morning weather outlook, once per day on the first run between morningHour and noon (GitHub can skip runs)
+    if ($wx -and ($ForceMorning -or ($now.Hour -ge $cfg.morningHour -and $now.Hour -lt 12 -and $state['morningDate'] -ne $today))) {
         $dayStorms = @(Get-StormHours $wx $now.Date $now.Date.AddDays(1))
         $solar = Get-SolarEstimate $wx 0
         if ($dayStorms.Count -gt 0) {
@@ -170,8 +170,8 @@ try {
         if (-not $ForceMorning) { $state['morningDate'] = $today }
     }
 
-    # 5. Daily summary, once per day at summaryHour
-    if ($ForceSummary -or ($now.Hour -eq $cfg.summaryHour -and $state['summaryDate'] -ne $today)) {
+    # 5. Daily summary, once per day on the first run from summaryHour to midnight
+    if ($ForceSummary -or ($now.Hour -ge $cfg.summaryHour -and $state['summaryDate'] -ne $today)) {
         $rep = Fox '/op/v0/device/report/query' ('{"sn":"' + $cfg.foxessSN + '","year":' + $now.Year + ',"month":' + $now.Month + ',"dimension":"month","variables":["PVEnergyTotal","loads","feedin","gridConsumption"]}')
         $t = @{}; foreach ($v in $rep.result) { $t[$v.variable] = [math]::Round([double]$v.values[$now.Day - 1], 1) }
         $money = ''
