@@ -18,7 +18,11 @@ $api = Join-Path $dir 'foxess.ps1'
 $statePath = Join-Path $dir 'state.json'
 $logPath = Join-Path $dir 'monitor.log'
 
-function Log($msg) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg" | Add-Content $logPath -Encoding utf8 }
+function Log($msg) {
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg"
+    $line | Add-Content $logPath -Encoding utf8
+    Write-Host $line   # also shows in the GitHub Actions run log
+}
 
 function Send-Alert($title, $msg, $priority = 'default', $tags = 'battery') {
     if ($DryRun) { Write-Output "[DRY RUN] $title :: $msg"; return }
@@ -27,7 +31,10 @@ function Send-Alert($title, $msg, $priority = 'default', $tags = 'battery') {
     Log "SENT $title :: $msg"
 }
 
-function Fox($path, $body) { & $api -Path $path -Body $body | ConvertFrom-Json }
+function Fox($path, $body) {
+    try { & $api -Path $path -Body $body | ConvertFrom-Json }
+    catch { throw "FoxESS $path : $($_.Exception.Message)" }
+}
 
 function Amber($path) {
     $key = $env:AMBER_API_KEY
@@ -193,11 +200,17 @@ try {
         Send-Alert 'Daily battery summary' $msg 'default' 'sunny'
         if (-not $ForceSummary) { $state['summaryDate'] = $today }
     }
+    $state['errorCount'] = 0
 } catch {
     Log "ERROR $($_.Exception.Message)"
     if ($DryRun) { throw }
-    # Tell you if the monitor itself keeps failing (at most once per repeat window).
-    if (Due 'error') { try { Send-Alert 'Battery monitor error' $_.Exception.Message 'low' 'x' } catch {}; Mark 'error' }
+    # One-off cloud hiccups are common; only tell you after 3 failed runs in a row (about 15 minutes),
+    # and then at most once per repeat window.
+    $state['errorCount'] = [int]$state['errorCount'] + 1
+    if ($state['errorCount'] -ge 3 -and (Due 'error')) {
+        try { Send-Alert 'Battery monitor error' "Failing for $($state['errorCount']) runs in a row: $($_.Exception.Message)" 'low' 'x' } catch {}
+        Mark 'error'
+    }
 }
 
 if (-not $DryRun) { $state | ConvertTo-Json | Set-Content $statePath -Encoding utf8 }
